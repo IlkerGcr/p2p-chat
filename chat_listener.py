@@ -62,7 +62,7 @@ def handle_client(conn: socket.socket, addr):
             secret = shared_secrets[ip]
             wowkey = str(secret).ljust(24)
             cipher = pyDes.triple_des(wowkey, padmode=pyDes.PAD_PKCS5)
-            pt = cipher.decrypt(ct).decode()
+            pt = cipher.decrypt(ct).decode('utf-8')
 
             print(f"[Secure] {user}: {pt}")
             save_to_log(ip, pt, sent=False)
