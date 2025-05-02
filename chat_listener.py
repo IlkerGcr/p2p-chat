@@ -1,98 +1,123 @@
 import socket
 import json
 import os
-from dh import calculate_shared_key, generate_public_key, PRIME
-from cryptography.fernet import Fernet
 import base64
 import hashlib
-from datetime import datetime
 import secrets
+import pyDes
+from datetime import datetime
+from dh import calculate_shared_key, generate_public_key, PRIME
 
 TCP_PORT = 6001
 CHAT_LOG_DIR = "chat_logs"
-
 os.makedirs(CHAT_LOG_DIR, exist_ok=True)
 
+# keep shared secrets by peer IP
+shared_secrets: dict[str, int] = {}
 
-def get_username_from_ip(ip, peer_file="peers.txt"):
+
+def get_username_from_ip(ip: str, peer_file: str = "peers.txt") -> str | None:
     try:
         with open(peer_file, "r") as f:
             for line in f:
-                saved_ip, name, _ = line.strip().split(",")
+                saved_ip, name, _ = line.strip().split(",", 2)
                 if saved_ip == ip:
                     return name
     except FileNotFoundError:
-        return None
+        pass
     return None
 
 
-def save_to_log(ip, msg, sent=False):
+def save_to_log(ip: str, msg: str, sent: bool = False):
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    log_file = os.path.join(CHAT_LOG_DIR, f"{ip}.log")
-    with open(log_file, "a") as f:
-        prefix = "Me" if sent else (get_username_from_ip(ip) or ip)
+    fn = os.path.join(CHAT_LOG_DIR, f"{ip}.log")
+    prefix = "Me" if sent else ip
+    with open(fn, "a") as f:
         f.write(f"[{now}] {prefix}: {msg}\n")
 
 
-def handle_client(conn, addr):
+def handle_client(conn: socket.socket, addr):
+    ip = addr[0]
     try:
-        # Read the very first JSON packet
-        data = conn.recv(2048).decode()
-        if not data:
+        raw = conn.recv(2048)
+        if not raw:
             return
-        msg_json = json.loads(data)
-        username = get_username_from_ip(addr[0]) or addr[0]
+        pkt = json.loads(raw.decode())
+        user = get_username_from_ip(ip) or ip
 
-        # 1) Handle unsecure one-off message immediately
-        if "unencrypted_message" in msg_json:
-            text = msg_json["unencrypted_message"]
-            print(f"[Unsecure] {username}: {text}")
-            save_to_log(addr[0], text, sent=False)
-            return  # close connection after handling
-
-        # 2) Otherwise, expect a DH key handshake
-        if "key" in msg_json:
-            their_pub_key = int(msg_json["key"])
-            private_number = secrets.randbelow(PRIME - 2) + 2
-            my_pub_key = generate_public_key(private_number)
-            conn.sendall(json.dumps({"key": str(my_pub_key)}).encode())
-
-            shared_secret = calculate_shared_key(their_pub_key, private_number)
-            print(f"[SecureChat] Shared key: {shared_secret}")
-            key_bytes = hashlib.sha256(str(shared_secret).encode()).digest()
-            fernet_key = base64.urlsafe_b64encode(key_bytes[:32])
-            cipher = Fernet(fernet_key)
-        else:
-            print(f"[Error] Unknown initial message from {username}")
+        # A) Plaintext chat
+        if "unencrypted_message" in pkt:
+            txt = pkt["unencrypted_message"]
+            print(f"[Unsecure] {user}: {txt}")
+            save_to_log(ip, txt, sent=False)
             return
 
-        # 3) Loop to receive all encrypted messages until the client closes
-        while True:
-            chunk = conn.recv(2048)
-            if not chunk:
-                break
-            packet = json.loads(chunk.decode())
+        # B) Reconnect-only encrypted blob
+        if "encrypted_message" in pkt:
+            if ip not in shared_secrets:
+                print(f"[Error] No shared key for {user}.")
+                return
 
-            if "encrypted_message" in packet:
-                decrypted = cipher.decrypt(packet["encrypted_message"].encode()).decode()
-                print(f"[Secure]   {username}: {decrypted}")
-                save_to_log(addr[0], decrypted, sent=False)
+            ct = base64.b64decode(pkt["encrypted_message"])
+            secret = shared_secrets[ip]
+            wowkey = str(secret).ljust(24)
+            cipher = pyDes.triple_des(wowkey, padmode=pyDes.PAD_PKCS5)
+            pt = cipher.decrypt(ct).decode()
+
+            print(f"[Secure] {user}: {pt}")
+            save_to_log(ip, pt, sent=False)
+            return
+
+        # C) DH handshake + one encrypted message
+        if "key" in pkt:
+            their_pub = int(pkt["key"])
+            # respond
+            priv = secrets.randbelow(PRIME - 2) + 2
+            my_pub = generate_public_key(priv)
+            conn.sendall(json.dumps({"key": str(my_pub)}).encode())
+
+            # compute & remember secret
+            secret = calculate_shared_key(their_pub, priv)
+            shared_secrets[ip] = secret
+
+            # receive one encrypted_message
+            raw2 = conn.recv(2048)
+            if not raw2:
+                print(f"[SecureChat] No payload from {user}.")
+                return
+            pkt2 = json.loads(raw2.decode())
+
+            if "encrypted_message" in pkt2:
+                ct2 = base64.b64decode(pkt2["encrypted_message"])
+                wowkey = str(secret).ljust(24)
+                cipher2 = pyDes.triple_des(wowkey, padmode=pyDes.PAD_PKCS5)
+                pt2 = cipher2.decrypt(ct2).decode()
+
+                print(f"[Secure] {user}: {pt2}")
+                save_to_log(ip, pt2, sent=False)
             else:
-                print(f"[Error] Unexpected packet from {username}: {packet}")
+                print(f"[Error] Unexpected after handshake: {pkt2}")
+            return
+
+        # D) Unknown packet
+        print(f"[Error] Unknown packet from {user}: {pkt}")
 
     except Exception as e:
-        print(f"[Error] Failed to handle client {addr[0]}: {e}")
+        print(f"[Error] Failed to handle {ip}: {e}")
     finally:
         conn.close()
 
 
 def start_chat_listener():
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(('', TCP_PORT))
-        s.listen()
-        print(f"[ChatListener] Listening for TCP on port {TCP_PORT}...")
+    """
+    Imported by main.py: bind to TCP_PORT and handle one message per conn.
+    """
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as srv:
+        srv.bind(('', TCP_PORT))
+        srv.listen()
+        print(f"[ChatListener] Listening on port {TCP_PORT}…")
         while True:
-            conn, addr = s.accept()
+            conn, addr = srv.accept()
             handle_client(conn, addr)
 
 
