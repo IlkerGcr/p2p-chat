@@ -1,117 +1,129 @@
 import socket
 import json
 import os
-from datetime import datetime
-from dh import generate_public_key, calculate_shared_key  # Diffie-Hellman key exchange
-from cryptography.fernet import Fernet  # For encryption
 import base64
-import hashlib
+import secrets
+from datetime import datetime
+
+import pyDes
+from dh import generate_public_key, calculate_shared_key, PRIME
 
 TCP_PORT = 6001
 CHAT_LOG_DIR = "chat_logs"
 PEER_FILE = "peers.txt"
 
-os.makedirs(CHAT_LOG_DIR, exist_ok=True)  # Ensure chat log folder exists
+# Ensure the log directory exists
+os.makedirs(CHAT_LOG_DIR, exist_ok=True)
 
 
-# Save messages to per-peer log files
-def save_to_log(ip, msg, sent=True):
+def save_to_log(ip: str, msg: str, sent: bool = True):
+    """Append a timestamped entry to chat_logs/<ip>.log."""
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    log_file = os.path.join(CHAT_LOG_DIR, f"{ip}.log")
-    with open(log_file, "a") as f:
-        prefix = "Me" if sent else ip
+    path = os.path.join(CHAT_LOG_DIR, f"{ip}.log")
+    prefix = "Me" if sent else ip
+    with open(path, "a") as f:
         f.write(f"[{now}] {prefix}: {msg}\n")
 
 
-# Read peers.txt and return the IP of a username
-def get_ip_from_username(username, peer_file=PEER_FILE):
+def get_ip_from_username(username: str, peer_file: str = PEER_FILE) -> str | None:
+    """Look up an IP address for a given username in peers.txt."""
     try:
         with open(peer_file, "r") as f:
             for line in f:
-                ip, name, _ = line.strip().split(",")
+                ip, name, _ = line.strip().split(",", 2)
                 if name == username:
                     return ip
     except FileNotFoundError:
-        print("[Error] Peer list not found.")
+        pass
     return None
 
 
-# Send unsecure message over TCP
-def send_unsecure_chat(ip):
-    print("Enter messages below. Type 'exit' to stop chatting.")
-    while True:
-        msg = input("You: ")
-        if msg.lower() == "exit":
-            break
-        if not msg.strip():
-            continue
-        try:
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                s.connect((ip, TCP_PORT))
-                json_message = json.dumps({ "unencrypted_message": msg })  # Use JSON key
-                s.sendall(json_message.encode())
-                save_to_log(ip, msg)
-        except Exception as e:
-            print(f"[Error] Could not send message to {ip}: {e}")
-
-
-# Send a secure message after performing DH key exchange
-def send_secure_chat(ip):
-    try:
-        private_number = int(input("Enter your private number: "))
-    except ValueError:
-        print("Invalid number.")
+def send_unsecure_chat(ip: str):
+    """Send exactly one plaintext JSON message, then close."""
+    msg = input("Enter unsecure message: ").strip()
+    if not msg:
+        print("[Unsecure] No message entered.")
         return
 
-    public_key = generate_public_key(private_number)
+    packet = json.dumps({"unencrypted_message": msg}).encode()
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.connect((ip, TCP_PORT))
+            s.sendall(packet)
+        save_to_log(ip, msg, sent=True)
+        print("[Unsecure] Message sent.")
+    except Exception as e:
+        print(f"[Error] Could not send unsecure to {ip}: {e}")
+
+
+def send_secure_chat(ip: str):
+    """Perform DH, derive 3DES key (PyDes), send one encrypted JSON, then close."""
+    # 1) Ask for our DH private exponent
+    try:
+        priv = int(input("Enter your DH private number: "))
+    except ValueError:
+        print("[Secure] Invalid number.")
+        return
+
+    # 2) Generate and send our DH public key
+    pub = generate_public_key(priv)
 
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             s.connect((ip, TCP_PORT))
-            # Step 1: send own public key
-            s.sendall(json.dumps({ "key": str(public_key) }).encode())
 
-            # Step 2: receive peer's public key
-            peer_data = s.recv(1024)
-            peer_json = json.loads(peer_data.decode())
-            peer_key = int(peer_json["key"])
+            # send { "key": "<our_pub>" }
+            s.sendall(json.dumps({"key": str(pub)}).encode())
 
-            # Step 3: calculate shared secret
-            shared_secret = calculate_shared_key(peer_key, private_number)
-            print(f"[SecureChat] Shared key: {shared_secret}")
+            # receive { "key": "<their_pub>" }
+            resp = s.recv(2048)
+            their_pub = int(json.loads(resp.decode())["key"])
 
-            # Step 4: convert shared secret to a Fernet key
-            key_bytes = hashlib.sha256(str(shared_secret).encode()).digest()
-            fernet_key = base64.urlsafe_b64encode(key_bytes[:32])
-            cipher = Fernet(fernet_key)
+            # compute shared secret
+            secret = calculate_shared_key(their_pub, priv)
+            print(f"[Secure] Shared secret: {secret}")
 
-            # Step 5: send encrypted messages
-            print("Enter messages below. Type 'exit' to stop chatting.")
-            while True:
-                msg = input("You: ")
-                if msg.lower() == "exit":
-                    break
-                if not msg.strip():
-                    continue
-                encrypted = cipher.encrypt(msg.encode())
-                s.sendall(json.dumps({ "encrypted_message": encrypted.decode() }).encode())
-                save_to_log(ip, msg)
+            # derive a 24-byte key string (left-justified, pad with spaces)
+            wowkey = str(secret).ljust(24)
+
+            # 3) Prompt for exactly one message
+            msg = input("Enter secure message: ").strip()
+            if not msg:
+                print("[Secure] No message entered.")
+                return
+
+            # 4) Encrypt with PyDes.triple_des + PAD_PKCS5 (padmode=2)
+            cipher = pyDes.triple_des(wowkey, padmode=pyDes.PAD_PKCS5)
+            raw_ct = cipher.encrypt(msg)
+
+            # 5) Base64-encode the raw ciphertext so it’s JSON-safe
+            blob = base64.b64encode(raw_ct).decode()
+
+            # 6) Send single JSON field { "encrypted_message": blob }
+            s.sendall(json.dumps({"encrypted_message": blob}).encode())
+            save_to_log(ip, msg, sent=True)
+            print("[Secure] Message sent. Connection closed.")
+
     except Exception as e:
         print(f"[Error] Secure chat failed: {e}")
 
 
-# General-purpose chat starter
-def start_chat(ip, secure):
+def start_chat(ip: str, secure: bool):
+    """Dispatch to secure or unsecure send and then exit."""
     if secure:
         send_secure_chat(ip)
     else:
         send_unsecure_chat(ip)
 
 
-# starts chat by using a username (uses peer list to get IP)
-def start_chat_by_username(username, secure, peer_file=PEER_FILE):
-    ip = get_ip_from_username(username, peer_file)
-    if ip:
-        start_chat(ip, secure)
-    else:
+def start_chat_by_username(username: str, secure: bool):
+    """
+    Entry point for main.py:
+      1. Lookup IP in peers.txt by username
+      2. Call send_secure_chat or send_unsecure_chat
+    """
+    ip = get_ip_from_username(username)
+    if not ip:
         print(f"[Error] User '{username}' not found in peer list.")
+        return
+    start_chat(ip, secure)
