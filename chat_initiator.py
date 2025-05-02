@@ -94,7 +94,7 @@ def send_secure_chat(ip: str):
 
             # 4) Encrypt with PyDes.triple_des + PAD_PKCS5 (padmode=2)
             cipher = pyDes.triple_des(wowkey, padmode=pyDes.PAD_PKCS5)
-            raw_ct = cipher.encrypt(msg)
+            raw_ct = cipher.encrypt(msg.encode('utf-8'))
 
             # 5) Base64-encode the raw ciphertext so it’s JSON-safe
             blob = base64.b64encode(raw_ct).decode()
