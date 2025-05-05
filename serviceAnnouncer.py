@@ -2,9 +2,9 @@ import socket
 import time
 import json
 
-#BROADCAST_IP = '192.168.1.255'   # As required  Normal kısım
+BROADCAST_IP = '192.168.1.255'   # As required  Normal kısım
 #BROADCAST_IPS = ['25.40.156.101', '25.18.31.237']  # Add your Hamachi peer IPs here
-BROADCAST_IP = '192.168.79.255'
+
 PORT = 6000
 BROADCAST_INTERVAL = 8.0
 
